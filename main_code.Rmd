@@ -1,0 +1,525 @@
+```{r imports, include=FALSE}
+library("ggplot2")
+library("gtsummary")
+library("labelled")
+library("dplyr")
+library("RColorBrewer")
+library("ggpubr")
+library("survminer")
+library("ggsurvfit")
+library("survival")
+library("expss")
+library("cowplot")
+library("grid")
+library("gridExtra")
+library("tidyr")
+library("flextable")
+library("MASS")
+
+palette = "RdBu" # https://r-graph-gallery.com/38-rcolorbrewers-palettes.html
+colors <- brewer.pal(n=11, name = palette)
+plot_colors_prim = c("#043061", "#d75f4e")
+plot_colors_sec = c("#043061", "#d75f4e")
+
+knitr::opts_chunk$set(dpi=300)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+```
+
+```{r load-data, include=FALSE}
+# Patient info table
+df_patients = read.csv("input/csf_patients.csv")
+
+# Event table with all events (new cord lesion) per SC MRI
+df_events = read.csv("input/csf_eventtable.csv")
+
+# Event table with events (new brain lesions) per bran MRI
+df_brainevents = read.csv("input/csf_eventtable_brain.csv")
+df_brainevents$outcome = dplyr::recode(df_brainevents$outcome ,'False'=0, 'True'=1)
+
+# Event table with max. one event per SC MRI
+df_events_norepeat = read.csv("input/csf_eventtable_norepeat.csv")
+```
+
+```{r reiber, include=FALSE}
+# Parameters of hyperbolic function (Reiber, 1998)
+IgG_ab = 0.93
+IgG_b2 = 6e-6
+IgG_c = 1.7e-3
+
+IgM_ab = 0.67
+IgM_b2 = 120e-6
+IgM_c = 7.1e-3
+
+# Reiber functions
+Qlim_IgG <- function(x){
+    return((IgG_ab * sqrt((x/100)**2+IgG_b2) - IgG_c)*100) # / * 100 to account for graph axis 10^-2
+}
+Qlim_IgM <- function(x){
+    return((IgM_ab * sqrt((x/100)**2+IgM_b2) - IgM_c)*100) # / * 100 to account for graph axis 10^-2
+}
+
+IF_IgG <- function(QAlb, QIgG){
+    Qlim = IgG_ab * sqrt(QAlb**2+IgG_b2) - IgG_c
+    return((1-Qlim/QIgG)*100)
+}
+
+IF_IgM <- function(QAlb, QIgM){
+    Qlim = IgM_ab * sqrt(QAlb**2+IgM_b2) - IgM_c
+    return((1-Qlim/QIgM)*100)
+}
+
+```
+
+```{r descriptives, include=FALSE}
+
+# Subset with complete IgM data
+igm_complete <- subset(df_patients, !is.na(IF_IgM))
+
+# Subset with complete IgG data
+igg_complete <- subset(df_patients, !is.na(IF_IgG))
+
+# Subset with complete OCB data
+ocb_complete <- subset(df_patients, !is.na(ocb_parsed))
+
+# Subset with complete IgM, IgG and OCB data
+csf_complete <- subset(df_patients, (!is.na(IF_IgM)) & (!is.na(IF_IgG)) & (!is.na(ocb)))
+csf_complete <- csf_complete[!duplicated(csf_complete$id_x),]
+csf_complete$igg_index = (csf_complete$igg * 100 * (csf_complete$alb_serum / 10)) / (csf_complete$igg_serum * 100 * csf_complete$alb * 100) * 1000
+csf_complete$igm_index = (csf_complete$igm * 100 * (csf_complete$alb_serum / 10)) / (csf_complete$igm_serum * 100 * csf_complete$alb * 100) * 1000
+
+# Subset with complete IgM, IgG and OCB data and follow-up SC MRI available
+csf_complete_follow_up <- subset(df_patients, (!is.na(IF_IgM)) & (!is.na(IF_IgG)) & (!is.na(ocb)) & (LAST_SCMRI_DATE != ""))
+igg_complete_follow_up <- subset(df_patients, (!is.na(IF_IgG)) & (!is.na(ocb)) & (LAST_SCMRI_DATE != ""))
+ocb_complete_follow_up <- subset(df_patients, (!is.na(ocb_parsed)) & (LAST_SCMRI_DATE != ""))
+ocb_complete_follow_up[ocb_complete_follow_up$ocb_parsed == 0, "ocb_di"] = 0
+ocb_complete_follow_up[ocb_complete_follow_up$ocb_parsed > 0, "ocb_di"] = 1
+
+csf_complete_follow_up$igg_index = (csf_complete_follow_up$igg * 100 * (csf_complete_follow_up$alb_serum / 10)) / (csf_complete_follow_up$igg_serum * 100 * csf_complete_follow_up$alb * 100) * 1000
+csf_complete_follow_up$igm_index = (csf_complete_follow_up$igm * 100 * (csf_complete_follow_up$alb_serum / 10)) / (csf_complete_follow_up$igm_serum * 100 * csf_complete_follow_up$alb * 100) * 1000
+
+csf_complete_follow_up$SCMRI_FOLLOWUP <- as.Date(as.character(csf_complete_follow_up$LAST_SCMRI_DATE), format="%Y-%m-%d")-
+                  as.Date(as.character(csf_complete_follow_up$FIRST_SCMRI_DATE), format="%Y-%m-%d")
+
+csf_complete[csf_complete$IgG_positive == 0 & csf_complete$IgM_positive == 0 & csf_complete$ocb_parsed > 0, "profile"] = "OCB+IgG-IgM-"
+OCBpIgGnIgMn = subset(csf_complete, (IgG_positive == 0) & (IgM_positive == 0) & (ocb_parsed > 0))
+
+csf_complete[csf_complete$IgG_positive == 1 & csf_complete$IgM_positive == 0 & csf_complete$ocb_parsed > 0, "profile"] = "OCB+IgG+IgM-"
+OCBpIgGpIgMn = subset(csf_complete, (IgG_positive == 1) & (IgM_positive == 0) & (ocb_parsed > 0))
+
+csf_complete[csf_complete$IgG_positive == 0 & csf_complete$IgM_positive == 1 & csf_complete$ocb_parsed > 0, "profile"] = "OCB+IgG-IgM+"
+OCBpIgGnIgMp = subset(csf_complete, (IgG_positive == 0) & (IgM_positive == 1) & (ocb_parsed > 0))
+
+csf_complete[csf_complete$IgG_positive == 1 & csf_complete$IgM_positive == 1 & csf_complete$ocb_parsed > 0, "profile"] = "OCB+IgG+IgM+"
+OCBpIgGpIgMp = subset(csf_complete, (IgG_positive == 1) & (IgM_positive == 1) & (ocb_parsed > 0))
+
+OCBp = subset(csf_complete, (ocb_parsed > 0))
+OCBn = subset(csf_complete, (ocb_parsed == 0))
+
+csf_complete_follow_up[csf_complete_follow_up$IgG_positive == 0 & csf_complete_follow_up$IgM_positive == 0 & csf_complete_follow_up$ocb_parsed > 0, "profile"] = "OCB+IgG-IgM-"
+OCBpIgGnIgMn = subset(csf_complete_follow_up, (IgG_positive == 0) & (IgM_positive == 0) & (ocb_parsed > 0))
+
+csf_complete_follow_up[csf_complete_follow_up$IgG_positive == 1 & csf_complete_follow_up$IgM_positive == 0 & csf_complete_follow_up$ocb_parsed > 0, "profile"] = "OCB+IgG+IgM-"
+OCBpIgGpIgMn = subset(csf_complete_follow_up, (IgG_positive == 1) & (IgM_positive == 0) & (ocb_parsed > 0))
+
+csf_complete_follow_up[csf_complete_follow_up$IgG_positive == 0 & csf_complete_follow_up$IgM_positive == 1 & csf_complete_follow_up$ocb_parsed > 0, "profile"] = "OCB+IgG-IgM+"
+OCBpIgGnIgMp = subset(csf_complete_follow_up, (IgG_positive == 0) & (IgM_positive == 1) & (ocb_parsed > 0))
+
+csf_complete_follow_up[csf_complete_follow_up$IgG_positive == 1 & csf_complete_follow_up$IgM_positive == 1 & csf_complete_follow_up$ocb_parsed > 0, "profile"] = "OCB+IgG+IgM+"
+OCBpIgGpIgMp = subset(csf_complete_follow_up, (IgG_positive == 1) & (IgM_positive == 1) & (ocb_parsed > 0))
+
+csf_complete_follow_up[csf_complete_follow_up$ocb_parsed == 0, "profile"] = "OCB-"
+csf_complete[csf_complete$ocb_parsed == 0, "profile"] = "OCB-"
+csf_complete[csf_complete$ocb_parsed == 0, "ocb_di"] = 0
+csf_complete[csf_complete$ocb_parsed > 0, "ocb_di"] = 1
+csf_complete_follow_up[csf_complete_follow_up$ocb_parsed == 0, "ocb_di"] = 0
+csf_complete_follow_up[csf_complete_follow_up$ocb_parsed > 0, "ocb_di"] = 1
+
+csf_complete$BRAINMRI_LESIONS_LAB = dplyr::recode(csf_complete$BRAINMRI_LESIONS ,'0'='0', '1'='1-2', '2'='3-8', '3'='9+')
+igg_complete$BRAINMRI_LESIONS_LAB = dplyr::recode(igg_complete$BRAINMRI_LESIONS ,'0'='0', '1'='1-2', '2'='3-8', '3'='9+')
+csf_complete$DISEASE_DURATION = -csf_complete$TIME_SINCE_CIS
+igg_complete$DISEASE_DURATION = -igg_complete$TIME_SINCE_CIS
+table_variables = c("profile", "AGE_AT_BASELINE", "DISEASE_DURATION", "gender", "EDSS", "FIRST_SCMRI_NEWLESIONCOUNT", "BRAINMRI_LESIONS_LAB", "RELAPSES_1Y", "igg_index", "igm_index", "leuco")
+
+var_label(csf_complete) <- list(AGE_AT_BASELINE = "Age at baseline", DISEASE_DURATION = "Disease duration at baseline", gender = "Gender", EDSS = "EDSS", BRAINMRI_LESIONS_LAB = "Brain MRI lesions at baseline", FIRST_SCMRI_NEWLESIONCOUNT = "Spinal cord lesions at baseline", RELAPSES_1Y = "Relapses in the year before baseline", igg_index = "IgG index", igm_index = "IgM index", leuco = "dummy") # BRAINMRI_ACTIVE = "New T2/T1-Gd+ lesions at baseline",
+```
+
+```{r igg-comparison-plot, include=FALSE}
+mean_iqr <- function(x) {
+   m <- median(x)
+   ymin <- quantile(x, 0.25)[[1]]
+   ymax <-  quantile(x, 0.75)[[1]]
+   return(c(y=m,ymin=ymin,ymax=ymax))
+}
+
+comparisons = list(c("Negative","Positive"))
+igg_complete$IgG_positive_lab <- factor(igg_complete$IgG_positive, levels=c("0", "1"), labels=c("Negative","Positive"))
+igg_baseline_test <- wilcox.test(igg_complete[igg_complete$IgG_positive == 0, "FIRST_SCMRI_NEWLESIONCOUNT"], igg_complete[igg_complete$IgG_positive == 1, "FIRST_SCMRI_NEWLESIONCOUNT"])
+
+# Get the count of observations per group
+group_counts <- igg_complete %>%
+  group_by(IgG_positive_lab) %>%
+  summarise(count = n())
+
+# Create a named vector for the group labels with the count
+group_labels <- group_counts %>%
+  mutate(label = paste(IgG_positive_lab, " (n=", count, ")", sep="")) %>%
+  pull(label)
+
+igg_single_plot <- igg_complete %>%
+  ggplot(aes(factor(IgG_positive_lab), FIRST_SCMRI_NEWLESIONCOUNT)) +
+  #geom_jitter(width=0.1)
+  geom_dotplot(binaxis = "y", stackdir = "center", aes(fill=factor(IgG_positive)), dotsize=0.10, binwidth=1) +
+  scale_fill_brewer(palette="RdBu") +
+  scale_x_discrete(labels = group_labels) +
+  stat_summary(fun.data=mean_iqr, col="#1BC1DB", geom="pointrange", size=0.5) +
+  stat_compare_means(method = "wilcox.test", comparisons=comparisons, label = "p.signif",
+         symnum.args = list(cutpoints = c(0, 0.00001, 0.0001, 0.001, 0.01, 0.05, 1),
+         symbols = c("p < 0.00001", "p < 0.0001", "p < 0.001", "p < 0.01", "p < 0.05", "ns"))) +
+  labs(x="IgG IF") +
+  scale_y_continuous(breaks = seq(0, 8, 1), limits=c(0,8)) +
+  theme_half_open(12) +
+  theme(legend.position="none", axis.title.y = element_blank())
+```
+
+```{r igm-comparison-plot, include=FALSE}
+comparisons = list(c("Negative","Positive"))
+csf_complete$IgM_positive_lab <- factor(csf_complete$IgM_positive, levels=c("0", "1"), labels=c("Negative","Positive"))
+igm_baseline_test <- wilcox.test(csf_complete[csf_complete$IgM_positive == 0, "FIRST_SCMRI_NEWLESIONCOUNT"], csf_complete[csf_complete$IgM_positive == 1, "FIRST_SCMRI_NEWLESIONCOUNT"])
+
+# Get the count of observations per group
+group_counts <- csf_complete %>%
+  group_by(IgM_positive_lab) %>%
+  summarise(count = n())
+
+# Create a named vector for the group labels with the count
+group_labels <- group_counts %>%
+  mutate(label = paste(IgM_positive_lab, " (n=", count, ")", sep="")) %>%
+  pull(label)
+
+igm_single_plot <- csf_complete %>%
+  ggplot(aes(factor(IgM_positive_lab), FIRST_SCMRI_NEWLESIONCOUNT)) +
+  geom_dotplot(binaxis = "y", stackdir = "center", aes(fill=factor(IgM_positive)), dotsize=0.10, binwidth=1) +
+  scale_fill_brewer(palette="RdBu") +
+  scale_x_discrete(labels = group_labels) +
+  stat_summary(fun.data=mean_iqr, col="#1BC1DB", geom="pointrange", size=0.5) +
+  stat_compare_means(method = "wilcox.test", comparisons=comparisons, label = "p.signif",
+         symnum.args = list(cutpoints = c(0, 0.00001, 0.0001, 0.001, 0.01, 0.05, 1),
+         symbols = c("p < 0.00001", "p < 0.0001", "p < 0.001", "p < 0.01", "p < 0.05", "ns"))) +
+  labs(x="IgM IF") +
+  scale_y_continuous(breaks = seq(0, 8, 1), limits=c(0,8)) +
+  theme_half_open(12) +
+  theme(legend.position="none", axis.text.y = element_blank(),
+                                    axis.title.y = element_blank())
+```
+
+```{r ig-multiple-comparison, include=FALSE}
+
+comparisons = list(c("IgG-IgM-","IgG-IgM+"), c("IgG-IgM-","IgG+IgM-"), c("IgG-IgM-", "IgG+IgM+"), c("IgG+IgM-","IgG+IgM+"))
+csf_complete$IgGIgM <- interaction(csf_complete$IgG_positive, csf_complete$IgM_positive)
+csf_complete$IgGIgM <- factor(csf_complete$IgGIgM, levels=c("0.0", "1.0", "0.1", "1.1"), labels=c("IgG-IgM-","IgG+IgM-","IgG-IgM+","IgG+IgM+"))
+
+# Get the count of observations per group
+group_counts <- csf_complete %>%
+  group_by(IgGIgM) %>%
+  summarise(count = n())
+
+# Create a named vector for the group labels with the count
+group_labels <- group_counts %>%
+  mutate(label = paste(IgGIgM, " (n=", count, ")", sep="")) %>%
+  pull(label)
+
+combined_plot <- csf_complete %>%
+  ggplot(aes(factor(IgGIgM), FIRST_SCMRI_NEWLESIONCOUNT)) +
+  geom_dotplot(binaxis = "y", stackdir = "center", aes(fill=factor(IgGIgM)), dotsize=0.10, binwidth=1) +
+  theme_half_open(12) +
+  scale_fill_brewer(palette="RdBu") +
+  scale_x_discrete(labels = group_labels) +
+  stat_summary(fun.data=mean_iqr, col="#22aaaa", geom="pointrange", size=0.5) +
+    stat_compare_means(method = "wilcox.test", comparisons=comparisons, label = "p.signif",
+         symnum.args = list(cutpoints = c(0, 0.00001, 0.0001, 0.001, 0.01, 0.05, 1),
+         symbols = c("p < 0.00001", "p < 0.0001", "p < 0.001", "p < 0.01", "p < 0.05", "ns"))) +
+  scale_y_continuous(breaks = seq(0, 9, 1), limits=c(0,9)) +
+  theme(legend.position="none",
+                                    axis.title.y = element_blank(), axis.title.x = element_blank())
+```
+
+```{r lm-igm-sc-assoc, include=FALSE}
+glm_igm = glm(IgM_positive ~ FIRST_SCMRI_NEWLESIONCOUNT + gender + DISEASE_DURATION + AGE_AT_BASELINE + factor(BRAINMRI_LESIONS_LAB), data=csf_complete, family = binomial)
+summary(glm_igm)
+exp(coef(glm_igm)["FIRST_SCMRI_NEWLESIONCOUNT"])
+```
+
+```{r lm-igg-sc-assoc, include=FALSE}
+glm_igg = glm(IgG_positive ~ FIRST_SCMRI_NEWLESIONCOUNT + gender + DISEASE_DURATION + AGE_AT_BASELINE + factor(BRAINMRI_LESIONS_LAB), data=csf_complete, family = binomial)
+summary(glm_igg)
+exp(coef(glm_igg)["FIRST_SCMRI_NEWLESIONCOUNT"])
+```
+
+```{r lm-or, include=FALSE}
+
+# Linear regression model corrected for important covariates
+lm_igm = lm(FIRST_SCMRI_NEWLESIONCOUNT ~ IgM_positive + IgG_positive + gender + DISEASE_DURATION + AGE_AT_BASELINE + factor(BRAINMRI_LESIONS_LAB), data=csf_complete)
+lm_igm_sum <- summary(lm_igm)
+lm_igg = lm(FIRST_SCMRI_NEWLESIONCOUNT ~ IgG_positive + IgM_positive + gender + DISEASE_DURATION + AGE_AT_BASELINE + factor(BRAINMRI_LESIONS_LAB), data=csf_complete)
+lm_igg_sum <-summary(lm_igg)
+
+# Extract coefficients and p-values
+lm_igm_or= exp(lm_igm_sum$coefficients[, 1][2])
+lm_igm_p = lm_igm_sum$coefficients[, 4][2]
+lm_igm_ci = exp(confint(lm_igm, level = 0.95)["IgM_positive",])
+lm_igg_or= exp(lm_igg_sum$coefficients[, 1][2])
+lm_igg_p = lm_igg_sum$coefficients[, 4][2]
+lm_igm_ci = exp(confint(lm_igg, level = 0.95)["IgG_positive",])
+
+# Ordinal regression
+or_brain <- polr(factor(BRAINMRI_LESIONS_LAB) ~ IgG_positive + IgM_positive + gender + DISEASE_DURATION + AGE_AT_BASELINE + FIRST_SCMRI_NEWLESIONCOUNT, data = csf_complete, Hess=TRUE)
+summary(or_brain)
+exp(coef(or_brain))
+(ctable <- coef(summary(or_brain)))
+or_brain_p <- pnorm(abs(ctable[, "t value"]), lower.tail = FALSE) * 2
+```
+
+```{r event-tables, include=FALSE}
+# Merge patient info table with event table (min interval follow-up SC MRI 90 days)
+df_patient_events <- merge(x = csf_complete_follow_up, y = df_events, by.x = "id_x", by.y = "patient_id", all.y = TRUE)
+df_patient_events_igg <- merge(x = igg_complete_follow_up, y = df_events, by.x = "id_x", by.y = "patient_id", all.y = TRUE)
+df_patient_events_ocb <- merge(x = ocb_complete_follow_up, y = df_events, by.x = "id_x", by.y = "patient_id", all.y = TRUE)
+df_patient_events_norepeat <- merge(x = csf_complete_follow_up, y = df_events_norepeat, by.x = "id_x", by.y = "patient_id", all.y = TRUE)
+df_patient_brainevents <- merge(x = csf_complete_follow_up, y = df_brainevents, by.x = "id_x", by.y = "patient_id", all.y = TRUE)
+df_patient_brainevents_igg <- merge(x = igg_complete_follow_up, y = df_brainevents, by.x = "id_x", by.y = "patient_id", all.y = TRUE)
+```
+
+```{r univariate-igm, include=FALSE}
+# Univariate Cox regression for IgM - Spinal cord
+igm_surv <- coxph(Surv(start, end, outcome) ~ IgM_positive, data=df_patient_events, id=patient_id)
+summary(igm_surv)
+igm_surv_coeff <- exp(summary(igm_surv)$coefficients[, 1][1])
+igm_surv_p <- summary(igm_surv)$coefficients[, 6][1]
+
+# Univariate Cox regression for IgM - Brain
+igm_surv_brain <- coxph(Surv(start, end, outcome) ~ IgM_positive, data=df_patient_brainevents, id=patient_id)
+summary(igm_surv_brain)
+igm_surv_brain_coeff <- exp(summary(igm_surv_brain)$coefficients[, 1][1])
+igm_surv_brain_p <- summary(igm_surv_brain)$coefficients[, 6][1]
+```
+
+```{r univariate-igg, include=FALSE}
+# Univariate Cox regression for IgG
+igg_surv <- coxph(Surv(start, end, outcome) ~ IgG_positive, data=df_patient_events, id=patient_id)
+summary(igg_surv)
+igg_surv_coeff <- exp(summary(igg_surv)$coefficients[, 1][1])
+igg_surv_p <- summary(igg_surv)$coefficients[, 6][1]
+
+igg_surv_brain <- coxph(Surv(start, end, outcome) ~ IgG_positive, data=df_patient_brainevents, id=patient_id)
+summary(igg_surv_brain)
+igg_surv_brain_coeff <- exp(summary(igg_surv_brain)$coefficients[, 1][1])
+igg_surv_brain_p <- summary(igg_surv_brain)$coefficients[, 6][1]
+```
+
+```{r multivariate, include=FALSE}
+# Multivariate model
+all_surv <- coxph(Surv(start, end, outcome) ~ IgG_positive + IgM_positive + AGE_AT_BASELINE + gender + FIRST_SCMRI_NEWLESIONCOUNT + factor(BRAINMRI_LESIONS) + factor(HIGHEST_CATEGORY), data=df_patient_events, id=patient_id)
+
+multi_igg_coef = summary(all_surv)$coefficients[, 2][1]
+multi_igg_p = summary(all_surv)$coefficients[, 6][1]
+multi_igg_lb = exp(confint(all_surv))["IgG_positive",][1]
+multi_igg_ub = exp(confint(all_surv))["IgG_positive",][2]
+multi_igm_coef = summary(all_surv)$coefficients[, 2][2]
+multi_igm_p = summary(all_surv)$coefficients[, 6][2]
+multi_igm_lb = exp(confint(all_surv))["IgM_positive",][1]
+multi_igm_ub = exp(confint(all_surv))["IgM_positive",][2]
+
+tbl_regression(all_surv, exponentiate = TRUE) %>% as_flex_table()
+
+all_surv_brain <- coxph(Surv(start, end, outcome) ~ IgG_positive + IgM_positive + AGE_AT_BASELINE + gender + FIRST_SCMRI_NEWLESIONCOUNT + factor(BRAINMRI_LESIONS) + factor(HIGHEST_CATEGORY), data=df_patient_brainevents, id=patient_id)
+summary(all_surv_brain)
+
+multi_igg_coef_brain = summary(all_surv_brain)$coefficients[, 2][1]
+multi_igg_p_brain = summary(all_surv_brain)$coefficients[, 6][1]
+multi_igg_lb_brain = exp(confint(all_surv_brain))["IgG_positive",][1]
+multi_igg_ub_brain = exp(confint(all_surv_brain))["IgG_positive",][2]
+multi_igm_coef_brain = summary(all_surv_brain)$coefficients[, 2][2]
+multi_igm_p_brain = summary(all_surv_brain)$coefficients[, 6][2]
+multi_igm_lb_brain = exp(confint(all_surv_brain))["IgM_positive",][1]
+multi_igm_ub_brain = exp(confint(all_surv_brain))["IgM_positive",][2]
+
+igg_surv <- coxph(Surv(start, end, outcome) ~ IgG_positive + AGE_AT_BASELINE + gender + FIRST_SCMRI_NEWLESIONCOUNT + factor(BRAINMRI_LESIONS) + factor(HIGHEST_CATEGORY), data=df_patient_events_igg, id=patient_id)
+summary(igg_surv)
+
+ocb_surv <- coxph(Surv(start, end, outcome) ~ factor(ocb_parsed), data=df_patient_events_ocb, id=patient_id)
+summary(ocb_surv)
+```
+
+```{r surv-sc, include=FALSE}
+
+# Funtion to generate survival plots
+generate_surv <- function(surv, labels, remove_y, no_legend, plot_colors, exp_val, ci95_lb, ci95_ub, p_val, ylabel = ""){
+if(remove_y){
+  plottheme = theme(legend.position = "top", legend.direction = "horizontal",
+                                    axis.title.y = element_blank())
+}else{
+  plottheme = theme(legend.position = "top", legend.direction = "horizontal")
+}
+remove_legend = NULL
+remove_legend_theme = NULL
+if(no_legend){
+  remove_legend = guides(color = guide_legend(override.aes= list(alpha = 0, color = "white", fill  = NA)))
+  remove_legend_theme = theme(
+        legend.position = "top",
+        legend.text = element_text(color = "white")
+    )
+}
+
+  a <- surv %>%
+  ggsurvfit(linewidth=1.3) +
+  labs(
+    x = "Years",
+    y = ylabel
+  ) +
+   # add_confidence_interval() +
+  add_risktable(times=seq(0,5,1), risktable_group = "risktable_stats", stats_label=c("Number at risk", "Cumulative number of events")) +
+  scale_x_continuous(breaks=seq(0,5,1)) +
+  coord_cartesian(xlim = c(0, 5), ylim=c(0, 1.5)) +
+  theme_classic2(base_size=12, base_family = "Arial") +
+  scale_color_manual(values=plot_colors, labels=labels)+
+  plottheme +
+    remove_legend +
+    remove_legend_theme +
+  add_risktable_strata_symbol(symbol = "\U25CF", size = 14) +
+  annotate(y = Inf, x = 0.25, hjust=0, vjust=1, geom="text", label = sprintf("HR %.2f (95%% CI %.2f, %.2f)\np %s%s", exp_val, ci95_lb, ci95_ub, ifelse(p_val < 0.001, "", "= "),format.pval(p_val, digits=3, nsmall=2, eps=0.001)), size=3, hjust = 0)
+  return(a)
+}
+
+df_patient_events_surv = df_patient_events
+df_patient_events_surv$start = df_patient_events$start/365.25
+df_patient_events_surv$end = df_patient_events$end/365.25
+
+surv = survfit2(Surv(start, end, outcome) ~ IgM_positive, data = df_patient_events_surv)
+a <- generate_surv(surv, c("IgM-", "IgM+"), TRUE, FALSE, plot_colors_sec, multi_igm_coef, multi_igm_lb, multi_igm_ub, multi_igm_p)
+
+a$data$estimate <- -log(a$data$estimate)
+a$data$conf.high <- -log(a$data$conf.high)
+a$data$conf.low <- -log(a$data$conf.low)
+
+igm_sc <- a
+
+surv = survfit2(Surv(start, end, outcome) ~ IgG_positive, data = df_patient_events_surv)
+a <- generate_surv(surv, c("IgG-", "IgG+"), FALSE, FALSE, plot_colors_prim, multi_igg_coef, multi_igg_lb, multi_igg_ub, multi_igg_p, expression(atop("Cumulative hazard of", bold("new cord lesions"))))
+
+a$data$estimate <- -log(a$data$estimate)
+a$data$conf.high <- -log(a$data$conf.high)
+a$data$conf.low <- -log(a$data$conf.low)
+
+igg_sc <- a
+```
+
+```{r surv-brain, include=FALSE}
+df_patient_events_surv = df_patient_brainevents
+df_patient_events_surv$start = df_patient_brainevents$start/365.25
+df_patient_events_surv$end = df_patient_brainevents$end/365.25
+surv = survfit2(Surv(start, end, outcome) ~ IgM_positive, data = df_patient_events_surv)
+a <- generate_surv(surv, c("IgM-", "IgM+"), TRUE, TRUE, plot_colors_sec, multi_igm_coef_brain, multi_igm_lb_brain, multi_igm_ub_brain, multi_igm_p_brain)
+
+
+a$data$estimate <- -log(a$data$estimate)
+a$data$conf.high <- -log(a$data$conf.high)
+a$data$conf.low <- -log(a$data$conf.low)
+
+igm_b <- a
+
+surv = survfit2(Surv(start, end, outcome) ~ IgG_positive, data = df_patient_events_surv)
+a <- generate_surv(surv, c("IgG-", "IgG+"), FALSE, TRUE, plot_colors_prim, multi_igg_coef_brain, multi_igg_lb_brain, multi_igg_ub_brain, multi_igg_p_brain, expression(atop("Cumulative hazard of", bold("new brain lesions"))))
+
+a$data$estimate <- -log(a$data$estimate)
+a$data$conf.high <- -log(a$data$conf.high)
+a$data$conf.low <- -log(a$data$conf.low)
+
+igg_b <- a
+
+```
+
+```{r reiberplots, fig.height=4, fig.width=8, fig.cap="Reiber plots, black line showing the limits (intrathecal fraction = 0 line). Blue and red dots, respectively, represent patiens with and without spinal cord lesions at baseline.", echo=FALSE}
+x = seq(1e-3, 25e-3, 1e-4)
+
+# plotting the data
+reiber_igm <- ggplot(csf_complete, aes(y = Q_IgM * 100, x = Q_Alb * 100, colour = factor(FIRST_SCMRI_NEWT2LESIONS)) ) +
+  geom_point()  +
+  geom_function(fun = Qlim_IgM, colour = "black") +
+  ylim(0, 3) +
+  scale_x_continuous(limits=c(0, 2.5)) +
+  labs(color="Spinal cord lesions at baseline", x=expression(paste("Albumin quotient x 10"^-2)), y="IgM quotient") +
+  theme_half_open(12) +
+  theme(legend.position="none", axis.title.y = element_blank(), axis.text.y = element_blank())
+
+reiber_igg <- ggplot(igg_complete, aes(y = Q_IgG * 100, x = Q_Alb * 100, colour = factor(FIRST_SCMRI_NEWT2LESIONS)) ) +
+  geom_point()  +
+  geom_function(fun = Qlim_IgG, colour = "black") +
+  ylim(0, 3) +
+  scale_x_continuous(limits=c(0, 2.5)) +
+  labs(color="Spinal cord lesions at baseline", x=expression(paste("Albumin quotient x 10"^-2)), y="IgG quotient") +
+  theme_half_open(12) +
+  theme(legend.position="none", axis.title.y = element_blank())
+
+legend_b <- cowplot::get_legend(reiber_igm +
+    guides(color = guide_legend(nrow = 1)) +
+    theme(legend.position = "right", legend.direction = "horizontal",legend.justification="center", legend.box.margin = margin(0, 0, 0, 0))
+)
+
+prow <- plot_grid(reiber_igg, reiber_igm,  labels=c("IgG", "IgM"), nrow = 1, align='vh', vjust=3, hjust=-3, label_size=12)
+reiber_row <- cowplot::plot_grid(legend_b, prow, ncol=1, rel_heights = c(.1, .8))
+```
+
+```{r table1, tab.env="table", tab.cap="Patient characteristics at baseline", echo=FALSE}
+
+table1 <- csf_complete %>% dplyr::select(table_variables) %>%
+  tbl_summary(by=profile,
+              type = list(RELAPSES_1Y ~ 'continuous', FIRST_SCMRI_NEWLESIONCOUNT ~ 'continuous', EDSS ~ 'continuous', leuco ~ 'continuous'),
+              statistic = list(RELAPSES_1Y ~ "{median} ({p25}, {p75})", DISEASE_DURATION ~ "{mean} ({sd})", FIRST_SCMRI_NEWLESIONCOUNT ~ "{median} ({p25}, {p75})"),
+               digits = list(EDSS ~ 1, FIRST_SCMRI_NEWLESIONCOUNT ~ 1, RELAPSES_1Y ~ 1), # , DISEASE_DURATION ~ 1
+              missing = "ifany",
+              missing_text = "(Missing)")
+
+table1 %>% as_flex_table()  %>% compose(
+  i = 17, j = 1, part = "body",
+  value = as_paragraph(
+    "CSF leucocytes x 10",
+    as_sup("6"), "/L"
+  )
+)
+
+```
+
+```{r ig-comparison-cowplot, fig.height=8, fig.width=8, fig.cap="Association between immunoglobulin intrathecal production and baseline spinal cord lesions. IF = intrathecal fraction. ns = not statistically significant. "}
+single_row <- cowplot::plot_grid(igg_single_plot, igm_single_plot, nrow=1)
+agg_plot <- cowplot::plot_grid(single_row, combined_plot, ncol=1, label_y="Spinal cord lesions at baseline")
+
+y.grob <- textGrob("Number of spinal cord lesions at baseline", gp=gpar(col="black", fontsize=12), rot=90)
+y.grob_2 <- textGrob(expression(paste("Ig quotient x 10"^-2)), gp=gpar(col="black", fontsize=12), rot=90)
+ggarrange(arrangeGrob(reiber_row, left = y.grob_2), arrangeGrob(agg_plot, left = y.grob), ncol=1, heights = c(1,2), labels=c("A", "B"))
+```
+
+```{r rate-descriptives, include=FALSE}
+a <- drop_na(df_patient_events, c('patient_id')) %>% group_by(patient_id)
+b <- merge(x = summarize_at(a, c('outcome'), sum), y = csf_complete_follow_up, by = "patient_id", all.y = TRUE)
+c <- b %>% group_by(profile) %>% summarize_at(c("outcome"), sum)
+# c %>% ggplot(aes(x=profile, y=outcome)) +     geom_bar(stat='identity', position= "dodge")
+d <- b %>% group_by(profile) %>% mutate(N = n_distinct(patient_id))
+e <- d[, c("profile", "SCMRI_FOLLOWUP", "N")] %>% group_by(profile) %>% summarize_at(c("SCMRI_FOLLOWUP", "N"), c(sum, max))
+f <- merge(x=c, y=e, by="profile")
+f$rate = f$outcome / as.numeric(f$SCMRI_FOLLOWUP_fn1 / 365.25)
+# f
+```
+
+```{r table2, tab.env="table", tab.cap="New cord lesions at follow-up per CSF profile"}
+f$rate = round(f$rate,2)
+f$follow_up_years = as.numeric(round(f$SCMRI_FOLLOWUP_fn1/365.25,1))
+ft <- flextable(f[,c("profile", "N_fn2", 'outcome', "follow_up_years", "rate")]) %>% set_header_labels(profile="CSF profile", N_fn2="n", outcome="New cord lesions", follow_up_years="Total follow-up years", rate="New cord lesions per patient year") %>% theme_vanilla() %>% autofit()
+
+ft
+
+```
+
+```{r surv-figs, fig.height=7.5, fig.width=8, fig.cap="Cumulative hazard plots and risk tables for spinal cord lesions (upper row) and brain lesions (lower row)."}
+cowplot::plot_grid(ggsurvfit_build(igg_sc), ggsurvfit_build(igm_sc), ggsurvfit_build(igg_b), ggsurvfit_build(igm_b))
+```
